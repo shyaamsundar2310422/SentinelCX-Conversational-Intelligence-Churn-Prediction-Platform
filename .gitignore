@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+venv/
+.env
+
+# Logs
+logs/*.jsonl
+
+# Model weights (do not commit)
+models/**/pytorch_model.bin
+models/**/model.safetensors
+models/**/training_args.bin
+
+# IDE / OS
+.vscode/
+.DS_Store
+
+__pycache__/
+*.pyc
+*.pyo
+
+models/**/pytorch_model.bin
+models/**/model.safetensors
+models/**/training_args.bin
+
+logs/*.jsonl
+.env
+venv/
