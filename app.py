@@ -2,15 +2,21 @@ import os
 import json
 from datetime import datetime
 import yaml
+import joblib
+import pandas as pd
+import torch
 
 from fastapi import FastAPI
 from pydantic import BaseModel
-import torch
 from transformers import XLMRobertaTokenizer, XLMRobertaForSequenceClassification
 
-# --------------------
-# Confidence decay config
-# --------------------
+from feature_engineering.conversation_features import ci_to_churn_features
+from aggregation.conversation_aggregation import aggregate_features
+
+# ======================================================
+# Config
+# ======================================================
+
 RULE_CONFIDENCE_DECAY = {
     "sarcasm_override": 0.15,
     "intent_sentiment_conflict": 0.12,
@@ -23,27 +29,21 @@ RULE_CONFIDENCE_DECAY = {
 DEFAULT_RULE_DECAY = 0.06
 MIN_CONFIDENCE = 0.60
 
-# --------------------
-# Logging setup
-# --------------------
 LOG_DIR = "logs"
 LOG_FILE = os.path.join(LOG_DIR, "rule_hits.jsonl")
 os.makedirs(LOG_DIR, exist_ok=True)
 
-def log_rule_hit(payload: dict):
-    payload["timestamp"] = datetime.utcnow().isoformat()
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+# ======================================================
+# App
+# ======================================================
 
-# --------------------
-# App setup
-# --------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-app = FastAPI(title="Conversation Intelligence API")
+app = FastAPI(title="Conversation Intelligence + Churn API")
 
-# --------------------
-# Load models
-# --------------------
+# ======================================================
+# Load CI models
+# ======================================================
+
 emotion_tokenizer = XLMRobertaTokenizer.from_pretrained("models/emotion_xlm_roberta_final")
 emotion_model = XLMRobertaForSequenceClassification.from_pretrained(
     "models/emotion_xlm_roberta_final"
@@ -59,37 +59,55 @@ intent_model = XLMRobertaForSequenceClassification.from_pretrained(
     "models/intent_xlm_roberta_final"
 ).to(device).eval()
 
-# --------------------
-# Load rules.yaml
-# --------------------
+# ======================================================
+# Load churn model
+# ======================================================
+
+churn_model = joblib.load("churn_model_real.joblib")
+
+with open("churn_features.json") as f:
+    CHURN_FEATURES = json.load(f)
+
+# ======================================================
+# Load rules
+# ======================================================
+
 with open("rules.yaml", "r", encoding="utf-8") as f:
     RULES_CONFIG = yaml.safe_load(f)
 
 RULES_VERSION = RULES_CONFIG.get("rules_version", "unknown")
-
 NEUTRAL_PHRASES = RULES_CONFIG.get("neutral_phrases", [])
 OUTCOME_PHRASES = RULES_CONFIG.get("outcome_phrases", [])
 SARCASM_PHRASES = RULES_CONFIG.get("sarcasm_phrases", [])
 DYNAMIC_RULES = RULES_CONFIG.get("rules", [])
 
-# --------------------
-# Request schema
-# --------------------
+# ======================================================
+# In-memory storage (demo)
+# ======================================================
+
+customer_logs = {}
+
+# ======================================================
+# Schemas
+# ======================================================
+
 class TextRequest(BaseModel):
+    customer_id: str
     text: str
 
-# --------------------
-# Model helper
-# --------------------
-def run_model(tokenizer, model, text):
-    inputs = tokenizer(
-        text,
-        return_tensors="pt",
-        truncation=True,
-        padding=True
-    )
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+# ======================================================
+# Helpers
+# ======================================================
 
+def log_rule_hit(payload: dict):
+    payload["timestamp"] = datetime.utcnow().isoformat()
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def run_model(tokenizer, model, text):
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
     with torch.no_grad():
         outputs = model(**inputs)
 
@@ -101,150 +119,103 @@ def run_model(tokenizer, model, text):
         "confidence": min(float(probs[pred_id]), 0.99)
     }
 
-def predict_emotion(text):
-    return run_model(emotion_tokenizer, emotion_model, text)
 
-def predict_sentiment(text):
-    return run_model(sentiment_tokenizer, sentiment_model, text)
-
-def predict_intent(text):
-    return run_model(intent_tokenizer, intent_model, text)
-
-# --------------------
-# Consistency + decision logic
-# --------------------
 def apply_consistency_rules(text, emotion, sentiment, intent):
     rules_triggered = []
-
     emotion_label = emotion["label"]
     sentiment_label = sentiment["label"]
     intent_label = intent["label"]
     text_lower = text.lower()
 
-    # Neutral phrase
     if any(p in text_lower for p in NEUTRAL_PHRASES):
         sentiment_label = "Neutral"
         rules_triggered.append("neutral_phrase")
 
-    # Outcome rule
     if any(p in text_lower for p in OUTCOME_PHRASES) and emotion_label in ["Sad", "Calm"]:
         sentiment_label = "Neutral"
         rules_triggered.append("outcome_override")
 
-    # Sarcasm rule
     if sentiment_label == "Positive" and any(p in text_lower for p in SARCASM_PHRASES):
         sentiment_label = "Negative"
         rules_triggered.append("sarcasm_override")
 
-    # YAML-driven rules
     for rule in DYNAMIC_RULES:
         cond = rule.get("if", {})
         then = rule.get("then", {})
 
-        emotion_ok = (
-            ("emotion" not in cond or cond["emotion"] == emotion_label) and
-            ("emotion_in" not in cond or emotion_label in cond["emotion_in"])
-        )
-        sentiment_ok = ("sentiment" not in cond or cond["sentiment"] == sentiment_label)
-        intent_ok = ("intent" not in cond or cond["intent"] == intent_label)
-
-        if emotion_ok and sentiment_ok and intent_ok:
-            if "sentiment" in then:
-                sentiment_label = then["sentiment"]
-            if "intent" in then:
-                intent_label = then["intent"]
+        if (
+            (cond.get("emotion") in [None, emotion_label]) and
+            (cond.get("sentiment") in [None, sentiment_label]) and
+            (cond.get("intent") in [None, intent_label])
+        ):
+            sentiment_label = then.get("sentiment", sentiment_label)
+            intent_label = then.get("intent", intent_label)
             rules_triggered.append(rule["name"])
 
-    # --------------------
-    # Confidence decay logic
-    # --------------------
-    base_confidence = sentiment["confidence"]
-    total_decay = 0.0
-    decay_breakdown = {}
-
-    for rule_name in rules_triggered:
-        decay = RULE_CONFIDENCE_DECAY.get(rule_name, DEFAULT_RULE_DECAY)
-        decay_breakdown[rule_name] = decay
-        total_decay += decay
-    
-    confidence_source = (
-    "rule_adjusted" if len(rules_triggered) > 0 else "model"
-)
-
-
-    final_confidence = max(
-        round(base_confidence - total_decay, 2),
-        MIN_CONFIDENCE
-    )
-
-    priority = "High" if intent_label == "Action_Urgent" else "Normal"
-    customer_state = "At Risk" if sentiment_label == "Negative" else "Stable"
+    base_conf = sentiment["confidence"]
+    total_decay = sum(RULE_CONFIDENCE_DECAY.get(r, DEFAULT_RULE_DECAY) for r in rules_triggered)
+    final_conf = max(round(base_conf - total_decay, 2), MIN_CONFIDENCE)
 
     return {
         "emotion": emotion,
         "sentiment": {
-    "label": sentiment_label,
-    "confidence": final_confidence,
-    "overridden": len(rules_triggered) > 0,
-    "confidence_source": confidence_source,
-    "confidence_breakdown": {
-        "model_confidence": round(base_confidence, 2),
-        "total_rule_decay": round(total_decay, 2),
-        "rule_decay_map": decay_breakdown,
-        "final_confidence": final_confidence
-    }
-},
-
-        "intent": {
-            "label": intent_label,
-            "confidence": intent["confidence"]
+            "label": sentiment_label,
+            "confidence": final_conf,
+            "overridden": len(rules_triggered) > 0
         },
-        "priority": priority,
-        "customer_state": customer_state,
+        "intent": intent,
         "rules_triggered": rules_triggered,
         "rules_version": RULES_VERSION
     }
 
-# --------------------
-# API endpoint
-# --------------------
-@app.post("/analyze")
-def analyze_text(req: TextRequest):
-    emotion = predict_emotion(req.text)
-    sentiment = predict_sentiment(req.text)
-    intent = predict_intent(req.text)
+def score_churn(features: dict):
+    full = {}
 
-    final_output = apply_consistency_rules(
-        text=req.text,
-        emotion=emotion,
-        sentiment=sentiment,
-        intent=intent
-    )
+    for f in CHURN_FEATURES:
+        full[f] = features.get(f, 0.0)   # default 0 if missing
+
+    X = pd.DataFrame([full])
+    return float(churn_model.predict_proba(X)[0, 1])
+
+# ======================================================
+# Routes
+# ======================================================
+
+@app.post("/analyze")
+def analyze(req: TextRequest):
+    emotion = run_model(emotion_tokenizer, emotion_model, req.text)
+    sentiment = run_model(sentiment_tokenizer, sentiment_model, req.text)
+    intent = run_model(intent_tokenizer, intent_model, req.text)
+
+    ci_output = apply_consistency_rules(req.text, emotion, sentiment, intent)
+
+    features = ci_to_churn_features(ci_output)
+
+    customer_logs.setdefault(req.customer_id, []).append(features)
 
     log_rule_hit({
-    "text": req.text,
+        "customer_id": req.customer_id,
+        "text": req.text,
+        "rules_triggered": ci_output["rules_triggered"]
+    })
 
-    "raw": {
-        "emotion": emotion["label"],
-        "sentiment": sentiment["label"],
-        "intent": intent["label"]
-    },
-
-    "final": {
-        "sentiment": final_output["sentiment"]["label"],
-        "intent": final_output["intent"]["label"]
-    },
-
-    "confidence": {
-        "source": final_output["sentiment"]["confidence_source"],
-        "final": final_output["sentiment"]["confidence"],
-        "total_rule_decay": final_output["sentiment"]["confidence_breakdown"]["total_rule_decay"]
-    },
-
-    "rules_triggered": final_output["rules_triggered"],
-    "overridden": final_output["sentiment"]["overridden"],
-    "rules_version": final_output["rules_version"]
-})
+    return ci_output
 
 
-    return final_output
+@app.get("/churn/{customer_id}")
+def churn_score(customer_id: str):
+    if customer_id not in customer_logs:
+        return {"error": "No messages found for customer"}
+
+    agg = aggregate_features(customer_logs[customer_id])
+    churn_prob = score_churn(agg)
+
+    return {
+        "customer_id": customer_id,
+        "churn_risk": churn_prob,
+        "risk_level": (
+            "High" if churn_prob > 0.7 else
+            "Medium" if churn_prob > 0.4 else
+            "Low"
+        )
+    }
